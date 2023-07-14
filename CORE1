@@ -1,0 +1,416 @@
+------------------------------------------------------------------------------------------------------
+-- INPUT PARAMETERS
+------------------------------------------------------------------------------------------------------
+DECLARE inputPartner STRING DEFAULT 'tufts';
+DECLARE inputReportPeriodStartDate DATE DEFAULT '2022-01-01';
+DECLARE inputReportPeriodEndDate DATE DEFAULT '2022-12-31';
+
+CREATE TEMP TABLE all_elements AS (
+
+------------ ELIGIBLE MEMBERS  -----------------------------------------------------------------------
+
+with allTufts as (
+    select distinct 
+        unnested_patientids as patientid,
+        d.firstName AS firstName,
+        d.lastName AS lastName, 
+        d.dateOfBirth,
+        e.memberid memberID,
+        e.eligEffectiveDate,
+        e.eligEndDate,
+        DATE_SUB(DATE_ADD(e.eligEffectiveDate, INTERVAL 3 Month), INTERVAL 1 DAY) as tuftsEnrollmentDate_90d,
+        trim(concat('Q',
+             format_date('%Q %Y', 
+             DATE_SUB(DATE_ADD(e.eligEffectiveDate, INTERVAL 3 Month),INTERVAL 1 DAY) ))) as enrollment_90d_Quarter,
+        LAST_DAY(DATE_SUB(DATE_ADD(e.eligEffectiveDate, INTERVAL 3 Month), INTERVAL 1 DAY), QUARTER) enrollment_90d_Quarter_last_day
+    FROM `cityblock-analytics.abs_member.abs_enterprise_member_elig_compliance`  e
+    cross join unnest (patientIds) as unnested_patientids 
+    LEFT JOIN `cityblock-analytics.abs_member.abs_enterprise_member_demo_compliance` d 
+    ON e.partner=d.partner 
+    AND unnested_patientids=d.patientId
+    where e.eligEffectiveDate is not null and e.partner=inputPartner
+) 
+
+,staticMMU as (
+    select distinct *
+    from allTufts
+    where eligEndDate >= tuftsEnrollmentDate_90d
+        and tuftsEnrollmentDate_90d between inputReportPeriodStartDate and inputReportPeriodEndDate
+        and eligEndDate >= enrollment_90d_Quarter_last_day
+    qualify row_number() over(partition by patientid order by eligEffectiveDate desc) = 1
+)  
+
+
+------------ Adding Variables  -----------------------------------------------------------------------
+,refusals_raw as (
+    select distinct ref.*
+    from staticMMU a
+    INNER join `cityblock-analytics.abs_client_reporting.DBT_Tufts_Refusals_Raw_temp` ref --should be a dbt model
+        on ref.patientid = a.patientid 
+        and ref.dateofRefusal between eligEffectiveDate and tuftsEnrollmentDate_90d
+        and refusalType = 'Assessment'
+) 
+
+---- H: MemberRefusalDateHRA
+,Refusals AS (
+    select distinct patientid
+                    ,dateofRefusal MemberRefusalDateHRA
+    from refusals_raw ref
+    where sourceType in ('CBH_questionHRA', 'CBH_timelineNote')
+    qualify row_number() over(partition by patientid order by dateofRefusal) = 1
+) 
+
+---- I, J, K: ApptNoShowDate
+,noshows as (
+    select distinct 
+        a.patientid,
+        dateNoShow ApptNoShowDate,
+        datefirstunsuccessfuloutreach ApptNoShowOutreachNoSuccessDate,
+        datefirstsuccessfuloutreach ApptNoShowOutreachSuccessDate
+    from staticMMU a
+    INNER JOIN `cityblock-analytics.abs_client_reporting.Temp_DBT_NoShows_CORE_2_1_3_2_20230627` noshw
+        on noshw.patientid=a.patientid
+        and dateNoShow between eligEffectiveDate and tuftsEnrollmentDate_90d
+   qualify row_number() over(partition by patientid order by dateNoShow) = 1
+) 
+
+---- L: MemberStatus, MemberStatusDate
+,MemberStatus as (
+    select distinct 
+        patientid,
+        dateofRefusal MemberStatusDate
+    from refusals_raw
+    where sourceType in ('CBH_commonsStatus')
+    qualify row_number() over(partition by patientid order by dateofRefusal) = 1
+)   
+
+---- M: MemberNotInterested
+,MemberNotInterested as (
+    select distinct 
+        patientid,
+        dateofRefusal MemberNotInterestedDate
+    from refusals_raw
+    where sourceType in ('CBH_CBHServices', 'CBH_notInterested')
+    qualify row_number() over(partition by patientid order by dateofRefusal) = 1
+) 
+
+---- O, P, Q, R, S: OutreachDate
+, outreaches_all AS (
+    select distinct a.patientid ,
+          outr.modality,
+          outr.successful,
+          outr.outreachDate
+    from staticMMU a
+    INNER JOIN `cityblock-analytics.abs_client_reporting.DBT_Tufts_Outreaches_Raw_v2_temp_20230626` outr
+     on outr.patientid = a.patientid 
+      and outr.outreachType = 'Assessment Scheduling'
+      and outr.outreachDate between eligEffectiveDate and tuftsEnrollmentDate_90d
+) 
+
+, outreaches_nodups AS (
+  select patientid,
+          modality,
+          outreachDate,
+          successful
+  from outreaches_all
+  group by patientid,
+          modality,
+          outreachDate,
+          successful
+) 
+
+, outreaches_unsucc AS (
+  select outr.patientid,
+          modality,
+          outreachDate,
+          successful,
+          row_number()over(partition by patientid, successful order by outreachDate, modality) rk
+  from outreaches_nodups outr
+  where successful=0
+) 
+
+---- T: dateofCompletedAssessment
+,CompletedAssesment as (
+    select distinct a.patientid
+        , dateofhra dateofCompletedAssessment
+    from `cityblock-analytics.abs_client_reporting.compliance_tufts_assessment` hra
+    inner join staticMMU a
+      on hra.patientid = a.patientid
+      and Source='CBH' 
+      and rnk=1
+      and dateofhra between eligEffectiveDate and tuftsEnrollmentDate_90d     
+    qualify row_number() over(partition by patientid order by dateofhra) = 1
+) 
+---- U: IncompleteHRADate
+ ,IncompleteHRADate AS (
+    select distinct 
+        patientid,
+        dateofRefusal IncompleteHRADate
+    from refusals_raw
+    where sourceType in ('CBH_incompleteHRA')
+    qualify row_number() over(partition by patientid order by dateofRefusal) = 1
+) 
+
+---- V: Appointment90plus
+,Appointment90plus as (
+    select distinct a.patientid
+        ,DATE(DATETIME( createdAt ,"America/New_York"))  Appointment90plusDate
+    from `cityblock-analytics.mrt_commons.appointments_info` hra
+    inner join staticMMU a
+      on hra.patientid = a.patientid
+      and apptTypeGrouped='Assessment'
+      and DATE(DATETIME( createdAt ,"America/New_York")) between eligEffectiveDate and DATE_ADD(tuftsEnrollmentDate_90d, interval -1 day) 
+      and DATE( DATETIME( appointmentAt ,"America/New_York" ) ) > tuftsEnrollmentDate_90d 
+    qualify row_number() over(partition by patientid order by Appointment90plusDate) = 1
+)
+
+---- W: P32RefusalDate
+ ,P32_Refusal_Date AS (
+    select distinct 
+        patientid,
+        dateofRefusal P32RefusalDate
+    from refusals_raw
+    where sourceType in ('P32')
+    qualify row_number() over(partition by patientid order by dateofRefusal) = 1
+)
+
+-- provisional: All together and format
+, allelements_prov as (
+    select distinct a.memberID,
+            a.firstName,
+            a.lastName,
+            FORMAT_DATE("%Y/%m/%d",a.dateOfBirth) dateOfBirth,
+            FORMAT_DATE("%Y/%m/%d",a.eligEffectiveDate) eligEffectiveDate ,
+            FORMAT_DATE("%Y/%m/%d",a.eligEndDate) eligEndDate,
+            FORMAT_DATE("%Y/%m/%d",ref.MemberRefusalDateHRA) MemberRefusalDateHRA,
+            FORMAT_DATE("%Y/%m/%d",nshw.ApptNoShowDate) ApptNoShowDate,
+            FORMAT_DATE("%Y/%m/%d",nshw.ApptNoShowOutreachNoSuccessDate) ApptNoShowOutreachNoSuccessDate,
+            FORMAT_DATE("%Y/%m/%d",nshw.ApptNoShowOutreachSuccessDate) ApptNoShowOutreachSuccessDate ,
+            FORMAT_DATE("%Y/%m/%d",mem.MemberStatusDate) MemberStatusDate,
+            FORMAT_DATE("%Y/%m/%d",notint.MemberNotInterestedDate) MemberNotInterestedDate,
+            FORMAT_DATE("%Y/%m/%d",firstout.outreachDate )  firstOutreachDate,
+            firstout.modality firstOutreachModality, 
+            FORMAT_DATE("%Y/%m/%d",secout.outreachDate)  secondOutreachDate,
+            secout.modality secondOutreachModality,
+            if(secout.outreachDate is not null,FORMAT_DATE("%Y/%m/%d",thirdout.outreachDate), null) thirdOutreachDate,
+            thirdout.modality thirdOutreachModality,
+            FORMAT_DATE("%Y/%m/%d",comphra.dateofCompletedAssessment) dateofCompletedAssessment,
+            FORMAT_DATE("%Y/%m/%d",incomp.IncompleteHRADate) IncompleteHRADate,
+            FORMAT_DATE("%Y/%m/%d",appt.Appointment90plusDate) Appointment90plusDate,
+            FORMAT_DATE("%Y/%m/%d",p32.P32RefusalDate) P32RefusalDate,
+            a.enrollment_90d_Quarter quarter
+    from staticMMU a
+    left join Refusals ref
+        on ref.patientId = a.patientid
+    left join noshows nshw
+        on nshw.patientId = a.patientid
+    left join MemberStatus mem
+        on mem.patientId = a.patientid
+    left join MemberNotInterested notint
+        on notint.patientId = a.patientid
+    left join outreaches_unsucc firstout
+        on firstout.patientId = a.patientid and firstout.rk=1
+    left join outreaches_unsucc secout
+        on secout.patientId = a.patientid and secout.rk=2
+    left join outreaches_unsucc thirdout
+        on thirdout.patientId = a.patientid and thirdout.rk=3
+    left join CompletedAssesment comphra
+        on comphra.patientId = a.patientid
+    left join IncompleteHRADate incomp
+        on incomp.patientId = a.patientid
+    left join Appointment90plus appt
+        on appt.patientId = a.patientid
+    left join P32_Refusal_Date p32
+        on p32.patientId = a.patientid
+)
+
+-- G: Refusal
+
+,allelements_prov_G as(
+    select distinct *,
+        CASE WHEN MemberRefusalDateHRA IS NOT NULL THEN MemberRefusalDateHRA
+            WHEN MemberStatusDate IS NOT NULL THEN MemberStatusDate
+            WHEN MemberNotInterestedDate IS NOT NULL THEN MemberNotInterestedDate
+            WHEN (ApptNoShowDate IS NOT NULL AND  ApptNoShowOutreachNoSuccessDate IS NOT NULL
+                     AND ApptNoShowOutreachSuccessDate IS NULL) THEN ApptNoShowDate
+            WHEN IncompleteHRADate IS NOT NULL THEN IncompleteHRADate
+            WHEN Appointment90plusDate IS NOT NULL THEN Appointment90plusDate
+            WHEN P32RefusalDate IS NOT NULL THEN P32RefusalDate
+            ELSE NULL
+        END refusalAssessment,
+    from allelements_prov
+)
+-- V: Element
+,allelements_prov_V as(
+    select distinct *,
+        CASE WHEN dateofCompletedAssessment IS NOT NULL THEN 'D'
+            WHEN refusalAssessment IS NOT NULL THEN 'B'
+            WHEN refusalAssessment IS NULL AND thirdOutreachDate IS NOT NULL THEN 'C'
+            ELSE 'A'
+        END element,
+    from allelements_prov_G
+)
+
+select distinct memberID,
+        firstName,
+        lastName,
+        dateOfBirth,
+        eligEffectiveDate,
+        eligEndDate,
+        refusalAssessment,
+        MemberRefusalDateHRA,
+        ApptNoShowDate,
+        ApptNoShowOutreachNoSuccessDate,
+        ApptNoShowOutreachSuccessDate,
+        MemberStatusDate,
+        MemberNotInterestedDate,
+        firstOutreachDate,
+        firstOutreachModality,
+        secondOutreachDate,
+        secondOutreachModality,
+        thirdOutreachDate,
+        thirdOutreachModality,
+        dateofCompletedAssessment,
+        IncompleteHRADate,
+        Appointment90plusDate,
+        P32RefusalDate,
+        quarter,
+        element
+from allelements_prov_V );
+
+# Output Tables
+
+CREATE TEMP TABLE client_list AS (
+    select memberID,
+        firstName,
+        lastName,
+        dateOfBirth,
+        eligEffectiveDate,
+        eligEndDate,
+        refusalAssessment,
+        firstOutreachDate,
+        secondOutreachDate,
+        thirdOutreachDate,
+        dateofCompletedAssessment,
+        quarter,
+        element
+    from all_elements   
+);
+
+CREATE TEMP TABLE elementA AS (
+    select memberID,
+        firstName,
+        lastName,
+        dateOfBirth,
+        eligEffectiveDate,
+        eligEndDate,
+        quarter
+    from client_list   
+);
+
+CREATE TEMP TABLE elementB AS (
+    select memberID,
+        firstName,
+        lastName,
+        dateOfBirth,
+        eligEffectiveDate,
+        eligEndDate,
+        refusalAssessment,
+        quarter
+    from client_list  
+    where element ='B' 
+);
+
+CREATE TEMP TABLE elementC AS (
+    select memberID,
+        firstName,
+        lastName,
+        dateOfBirth,
+        eligEffectiveDate,
+        eligEndDate,
+        firstOutreachDate,
+        secondOutreachDate,
+        thirdOutreachDate,
+        quarter
+    from client_list
+    where element ='C'    
+);
+
+CREATE TEMP TABLE elementD AS (
+    select memberID,
+        firstName,
+        lastName,
+        dateOfBirth,
+        eligEffectiveDate,
+        eligEndDate,
+        dateofCompletedAssessment,
+        quarter
+    from client_list   
+    where element ='D' 
+);
+---------------------------------------------------------------------------------------
+-- OUTPUT
+---------------------------------------------------------------------------------------
+select *from all_elements;
+select * from client_list;
+select * from elementA;
+select * from elementB;
+select * from elementC;
+select * from elementD;
+---------------------------------------------------------------------------------------
+-- Quality Checks
+---------------------------------------------------------------------------------------
+select
+    (select count(concat(memberid,eligEffectiveDate)) from all_elements) Q1members,
+    (select count(distinct concat(memberid,eligEffectiveDate)) from all_elements) Q1distinctmembers,
+    (select count(memberid) 
+    from all_elements
+    where PARSE_DATE('%Y/%m/%d', eligEndDate) >= inputReportPeriodEndDate) Q2EndDateAfterorOnPeriodEnd,
+    (select count(memberid) 
+     from all_elements
+     where PARSE_DATE('%Y/%m/%d',eligEndDate)>= DATE_SUB(DATE_ADD(
+         PARSE_DATE('%Y/%m/%d',eligEffectiveDate), INTERVAL 3 Month), INTERVAL 1 DAY) 
+     ) Q3EndDateAfter90thDay,
+    (select distinct element from all_elements
+    where dateofCompletedAssessment is not null) Q4distinctelemnt,
+    (select count(memberID) from all_elements
+    where dateofCompletedAssessment is not null and element<>'D') Q4,
+    (select count(memberID) from all_elements
+    where dateofCompletedAssessment is not null) Q5allmemberswithAssesment,
+    (select count(memberID) from all_elements
+    where PARSE_DATE('%Y/%m/%d',dateofCompletedAssessment) between PARSE_DATE('%Y/%m/%d',eligEffectiveDate) and DATE_SUB(DATE_ADD(
+         PARSE_DATE('%Y/%m/%d',eligEffectiveDate), INTERVAL 3 Month), INTERVAL 1 DAY) ) Q5,
+    (select count(memberID) from all_elements where firstOutreachDate is not null ) allmembers_FirstOutreach,
+    (select count(memberID) from all_elements where 
+        firstOutreachDate is not null and
+        (firstOutreachDate<= secondOutreachDate or secondOutreachDate is null) 
+            AND (firstOutreachDate<= thirdOutreachDate or thirdOutreachDate is null)) Q6,
+    (select count(memberID) from all_elements where secondOutreachDate is not null ) allmembers_SecondOutreach,
+    (select count(memberID) from all_elements where 
+        secondOutreachDate is not null and
+        (secondOutreachDate<= thirdOutreachDate or thirdOutreachDate is null) ) Q7,
+    (select count(memberID) from all_elements where 
+        firstOutreachDate is not null and
+        PARSE_DATE( '%Y/%m/%d',firstOutreachDate) between PARSE_DATE('%Y/%m/%d',eligEffectiveDate) and DATE_SUB(DATE_ADD(
+         PARSE_DATE('%Y/%m/%d',eligEffectiveDate), INTERVAL 3 Month), INTERVAL 1 DAY)) Q8,
+    (select count(memberID) from all_elements where 
+        secondOutreachDate is not null and
+        PARSE_DATE('%Y/%m/%d',secondOutreachDate) between PARSE_DATE('%Y/%m/%d',eligEffectiveDate) and DATE_SUB(DATE_ADD(
+         PARSE_DATE('%Y/%m/%d',eligEffectiveDate), INTERVAL 3 Month), INTERVAL 1 DAY) ) Q9,
+    (select count(memberID) from all_elements where thirdOutreachDate is not null ) allmembers_ThirdOutreach,
+    (select count(memberID) from all_elements where 
+         thirdOutreachDate is not null and
+        PARSE_DATE('%Y/%m/%d',thirdOutreachDate) between PARSE_DATE('%Y/%m/%d',eligEffectiveDate) and DATE_SUB(DATE_ADD(
+         PARSE_DATE('%Y/%m/%d',eligEffectiveDate), INTERVAL 3 Month), INTERVAL 1 DAY) ) Q10,
+    (select count(memberID) from all_elements where refusalAssessment is not null ) allmembers_RefusalAssesment,    
+    (select count(memberID) from all_elements where 
+         refusalAssessment is not null and
+        PARSE_DATE('%Y/%m/%d',refusalAssessment) between PARSE_DATE('%Y/%m/%d',eligEffectiveDate) and DATE_SUB(DATE_ADD(
+         PARSE_DATE('%Y/%m/%d',eligEffectiveDate), INTERVAL 3 Month), INTERVAL 1 DAY) ) Q11,
+    (select count(memberID) from elementA ) Q12ElementA,
+    (select count(memberID) from all_elements where element='B') allmembers_elementB,
+    (select count(memberID) from elementB ) Q13ElementB,
+    (select count(memberID) from all_elements where element='C') allmembers_elementC,
+    (select count(memberID) from elementC ) Q14ElementC,
+    (select count(memberID) from all_elements where element='D') allmembers_elementD,
+    (select count(memberID) from elementD ) Q15ElementD
